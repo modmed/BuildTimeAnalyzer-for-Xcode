@@ -9,7 +9,7 @@ typealias CMUpdateClosure = (_ result: [CompileMeasure], _ didComplete: Bool, _ 
 
 fileprivate let regex = try! NSRegularExpression(pattern:  "^\\d*\\.?\\d*ms\\t/", options: [])
 
-protocol LogProcessorProtocol: class {
+protocol LogProcessorProtocol: AnyObject {
     var rawMeasures: [String: RawMeasure] { get set }
     var updateHandler: CMUpdateClosure? { get set }
     var shouldCancel: Bool { get set }
@@ -22,11 +22,29 @@ class LogProcessor: NSObject, LogProcessorProtocol {
     
     var rawMeasures: [String: RawMeasure] = [:]
     var updateHandler: CMUpdateClosure?
-    var shouldCancel = false
+    var _shouldCancel = false
+    var shouldCancel: Bool {
+        get {
+            var result: Bool = false
+            shouldCancelQueue.sync {
+                result = _shouldCancel
+            }
+            return result
+        }
+        set {
+            shouldCancelQueue.sync {
+                _shouldCancel = newValue
+            }
+        }
+    }
+    var didComplete = false
     var timer: Timer?
+    let rawMeasureQueue = DispatchQueue(label: "Raw Measure")
+    let shouldCancelQueue = DispatchQueue(label: "Should Cancel")
     
     func processingDidStart() {
         DispatchQueue.main.async {
+            self.didComplete = false
             self.timer = Timer.scheduledTimer(timeInterval: 1.5, target: self, selector: #selector(self.timerCallback(_:)), userInfo: nil, repeats: true)
         }
     }
@@ -37,12 +55,13 @@ class LogProcessor: NSObject, LogProcessorProtocol {
             self.timer = nil
             let didCancel = self.shouldCancel
             self.shouldCancel = false
-            self.updateResults(didComplete: true, didCancel: didCancel)
+            self.didComplete = true
+            self.updateResults(didComplete: self.didComplete, didCancel: didCancel)
         }
     }
     
     @objc func timerCallback(_ timer: Timer) {
-        updateResults(didComplete: false, didCancel: false)
+        updateResults(didComplete: didComplete, didCancel: false)
     }
 
     func processDatabase(database: XcodeDatabase, updateHandler: CMUpdateClosure?) {
@@ -63,7 +82,9 @@ class LogProcessor: NSObject, LogProcessorProtocol {
         let characterSet = CharacterSet(charactersIn:"\r")
         var remainingRange = text.startIndex..<text.endIndex
 
-        rawMeasures.removeAll()
+        rawMeasureQueue.sync {
+            self.rawMeasures.removeAll()
+        }
 
         processingDidStart()
 
@@ -81,12 +102,15 @@ class LogProcessor: NSObject, LogProcessorProtocol {
             let matchRange = Range<String.Index>.init(match.range, in: text)!
             let timeString = text[remainingRange.lowerBound..<text.index(matchRange.upperBound, offsetBy: -4)]
             if let time = Double(timeString) {
-                let value = String(text[text.index(before: matchRange.upperBound)..<nextRange.upperBound])
-                if let rawMeasure = rawMeasures[value] {
-                    rawMeasure.time += time
-                    rawMeasure.references += 1
-                } else {
-                    rawMeasures[value] = RawMeasure(time: time, text: value)
+                rawMeasureQueue.sync {
+                    let value = String(text[text.index(before: matchRange.upperBound)..<nextRange.upperBound])
+                    let rawMeasure = rawMeasures[value]
+                    if let rawMeasure = rawMeasure {
+                        rawMeasure.time += time
+                        rawMeasure.references += 1
+                    } else {
+                        self.rawMeasures[value] = RawMeasure(time: time, text: value)
+                    }
                 }
             }
         }
@@ -95,17 +119,20 @@ class LogProcessor: NSObject, LogProcessorProtocol {
 
     fileprivate func updateResults(didComplete completed: Bool, didCancel: Bool) {
         DispatchQueue.global(qos: .userInteractive).async {
-            let measures = self.rawMeasures.values
-            var filteredResults = measures.filter{ $0.time > 10 }
-            if filteredResults.count < 20 {
-                filteredResults = measures.filter{ $0.time > 0.1 }
-            }
+            var result = [CompileMeasure]()
+            self.rawMeasureQueue.sync {
+                let measures = self.rawMeasures.values
+                var filteredResults = measures.filter{ $0.time > 10 }
+                if filteredResults.count < 20 {
+                    filteredResults = measures.filter{ $0.time > 0.1 }
+                }
 
-            let sortedResults = filteredResults.sorted(by: { $0.time > $1.time })
-            let result = self.processResult(sortedResults)
+                let sortedResults = filteredResults.sorted(by: { $0.time > $1.time })
+                result = self.processResult(sortedResults)
 
-            if completed {
-                self.rawMeasures.removeAll()
+                if completed {
+                    self.rawMeasures.removeAll()
+                }
             }
 
             DispatchQueue.main.async {

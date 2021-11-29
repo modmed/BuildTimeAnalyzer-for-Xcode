@@ -5,7 +5,7 @@
 
 import Foundation
 
-protocol DirectoryMonitorDelegate: class {
+protocol DirectoryMonitorDelegate: AnyObject {
     func directoryMonitorDidObserveChange(_ directoryMonitor: DirectoryMonitor, isDerivedData: Bool)
 }
 
@@ -44,11 +44,13 @@ class DirectoryMonitor {
             }
         }
         dispatchSource?.setCancelHandler {
-            close(self.fileDescriptor)
-            
-            self.fileDescriptor = -1
-            self.dispatchSource = nil
-            self.path = nil
+            DispatchQueue.main.async {
+                close(self.fileDescriptor)
+
+                self.fileDescriptor = -1
+                self.dispatchSource = nil
+                self.path = nil
+            }
         }
         dispatchSource?.resume()
         
